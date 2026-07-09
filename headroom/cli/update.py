@@ -17,6 +17,7 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import click
 
@@ -161,6 +162,32 @@ def _managed_env_guidance() -> str:
         "Headroom is installed in an externally-managed system Python (PEP 668). "
         f"Don't pip into it — {hint}."
     )
+
+
+def _find_core_pyd() -> Path | None:
+    """Locate the _core.pyd file inside the headroom site-packages directory."""
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("headroom")
+        if spec and spec.submodule_search_locations:
+            for loc in spec.submodule_search_locations:
+                pyd_path = Path(loc) / "_core.pyd"
+                if pyd_path.is_file():
+                    return pyd_path
+    except Exception:
+        pass
+    return None
+
+
+def _is_core_pyd_locked(pyd_path: Path) -> bool:
+    """Check if the _core.pyd file is locked (in use)."""
+    try:
+        with open(pyd_path, "ab"):
+            pass
+        return False
+    except OSError:
+        return True
 
 
 def detect_install_method(extras: str | None = None) -> InstallMethod:
@@ -315,6 +342,14 @@ def update(check_only: bool, assume_yes: bool, allow_pre: bool, extras: str | No
 
     if check_only:
         return
+
+    if sys.platform.startswith("win"):
+        pyd_path = _find_core_pyd()
+        if pyd_path and _is_core_pyd_locked(pyd_path):
+            raise click.ClickException(
+                "headroom proxy is running and locking _core.pyd. "
+                "Please stop the running proxy before updating."
+            )
 
     if not assume_yes and not click.confirm("Proceed with the upgrade?", default=True):
         click.echo("Aborted.")

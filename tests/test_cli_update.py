@@ -175,3 +175,88 @@ def test_update_upgrade_failure_surfaces_command(monkeypatch):
     res = CliRunner().invoke(main, ["update", "--yes"])
     assert res.exit_code != 0
     assert "Upgrade failed" in res.output
+
+
+def test_find_core_pyd(monkeypatch, tmp_path):
+    class MockSpec:
+        submodule_search_locations = [str(tmp_path)]
+
+    import importlib.util
+    original_find_spec = importlib.util.find_spec
+
+    def mock_find_spec(name):
+        if name == "headroom":
+            return MockSpec()
+        return original_find_spec(name)
+
+    monkeypatch.setattr(importlib.util, "find_spec", mock_find_spec)
+
+    assert up._find_core_pyd() is None
+
+    pyd_file = tmp_path / "_core.pyd"
+    pyd_file.touch()
+    assert up._find_core_pyd() == pyd_file
+
+
+def test_is_core_pyd_locked(tmp_path):
+    pyd_file = tmp_path / "_core.pyd"
+    pyd_file.touch()
+
+    assert not up._is_core_pyd_locked(pyd_file)
+
+    if sys.platform.startswith("win"):
+        import ctypes
+        h = ctypes.windll.kernel32.CreateFileW(
+            str(pyd_file),
+            0x80000000,  # GENERIC_READ
+            1,           # FILE_SHARE_READ
+            None,
+            3,           # OPEN_EXISTING
+            0x80,        # FILE_ATTRIBUTE_NORMAL
+            None
+        )
+        try:
+            assert up._is_core_pyd_locked(pyd_file)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+
+
+def test_update_windows_locked_core_pyd(monkeypatch, tmp_path):
+    monkeypatch.setattr(up, "installed_version", lambda: "0.26.0")
+    monkeypatch.setattr(up, "fetch_latest_version", lambda **k: "0.27.0")
+    monkeypatch.setattr(up, "_in_virtualenv", lambda: True)
+    monkeypatch.setattr(up.sys, "platform", "win32")
+
+    pyd_file = tmp_path / "_core.pyd"
+    pyd_file.touch()
+
+    monkeypatch.setattr(up, "_find_core_pyd", lambda: pyd_file)
+    monkeypatch.setattr(up, "_is_core_pyd_locked", lambda path: True)
+
+    res = CliRunner().invoke(main, ["update"])
+    assert res.exit_code != 0
+    assert "proxy is running and locking _core.pyd" in res.output
+
+
+def test_update_windows_unlocked_core_pyd(monkeypatch, tmp_path):
+    monkeypatch.setattr(up, "installed_version", lambda: "0.26.0")
+    monkeypatch.setattr(up, "fetch_latest_version", lambda **k: "0.27.0")
+    monkeypatch.setattr(up, "_in_virtualenv", lambda: True)
+    monkeypatch.setattr(up.sys, "platform", "win32")
+
+    pyd_file = tmp_path / "_core.pyd"
+    pyd_file.touch()
+
+    monkeypatch.setattr(up, "_find_core_pyd", lambda: pyd_file)
+    monkeypatch.setattr(up, "_is_core_pyd_locked", lambda path: False)
+
+    calls = []
+    class _Result:
+        returncode = 0
+    monkeypatch.setattr(up.subprocess, "run", lambda argv, *a, **k: calls.append(argv) or _Result())
+
+    res = CliRunner().invoke(main, ["update", "--yes"])
+    assert res.exit_code == 0
+    assert len(calls) == 1
+    assert "upgraded to 0.27.0" in res.output
+
