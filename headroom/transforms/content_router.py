@@ -46,6 +46,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from ..config import (
@@ -650,6 +651,14 @@ class ContentRouterConfig:
     protect_error_outputs: bool = True
     error_protection_max_chars: int = 8000  # ~2K tokens; larger errors compress
 
+    # Graph-scoped narrowing: filter wide discovery-tool output (grep/glob/ls)
+    # down to files within N import-hops of the agent's last-read file. See
+    # `headroom/graph_context.py`. Off if codebase-memory-mcp isn't installed
+    # (GraphContext.available is False) regardless of this flag.
+    enable_graph_narrow: bool = True
+    graph_narrow_max_hops: int = 2
+    graph_narrow_min_lines: int = 20  # below this, output is already narrow
+
     # Cache safety: assistant text-block compression.
     # Default OFF. Assistant content is echoed back by the client in
     # subsequent turns and becomes part of the upstream provider's
@@ -729,6 +738,32 @@ _CODE_FENCE_PATTERN = re.compile(r"^```(\w*)\s*$", re.MULTILINE)
 _JSON_BLOCK_START = re.compile(r"^\s*[\[{]", re.MULTILINE)
 _SEARCH_RESULT_PATTERN = re.compile(r"^\S+:\d+:", re.MULTILINE)
 _PROSE_PATTERN = re.compile(r"[A-Z][a-z]+\s+\w+\s+\w+")
+
+# Graph-scoped narrowing (see `_graph_narrow`): tool names whose output is a
+# wide file listing worth narrowing, and the read-tool calls used to find the
+# BFS entry point (the file the agent most recently opened).
+_DISCOVERY_TOOL_NAMES = frozenset({"Grep", "Glob", "LS"})
+_READ_TOOL_NAMES = frozenset({"Read", "read_file", "view_file", "open_file", "cat"})
+_READ_PATH_ARG_KEYS = ("file_path", "path", "target_file", "filePath")
+
+
+def _extract_discovery_path(line: str, tool_name: str) -> str | None:
+    """Best-effort file path for one line of discovery-tool output.
+
+    Grep/ripgrep-style lines are `path:line:content` (`_SEARCH_RESULT_PATTERN`
+    above matches the same shape) — the path is the first colon-delimited
+    field. Glob/LS output is bare paths, one per line. Lines that don't look
+    like a path (headers, blank lines, summaries) return `None` and are
+    always kept: narrowing only drops lines it's confident name a file
+    outside the neighborhood.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return None
+    candidate = stripped.split(":", 1)[0] if tool_name == "Grep" else stripped
+    if "/" not in candidate and "." not in candidate:
+        return None
+    return candidate
 
 
 def is_mixed_content(content: str) -> bool:
@@ -1010,6 +1045,9 @@ class ContentRouter(Transform):
 
         # TOIN integration for cross-strategy learning
         self._toin: Any = None
+
+        # Graph-scoped narrowing (lazy: only touched if enable_graph_narrow)
+        self._graph_context: Any = None
 
         # F2.2: per-request CompressionPolicy, set from
         # ``kwargs["compression_policy"]`` at the start of ``apply()``
@@ -1937,6 +1975,105 @@ class ContentRouter(Transform):
                 logger.debug("LogCompressor not available")
         return self._log_compressor
 
+    def _get_graph_context(self) -> Any:
+        """Get GraphContext (lazy load). Returns None if disabled or unavailable."""
+        if not self.config.enable_graph_narrow:
+            return None
+        if self._graph_context is None:
+            try:
+                from ..graph_context import GraphContext
+
+                self._graph_context = GraphContext(project_dir=Path.cwd())
+            except ImportError:
+                logger.debug("GraphContext not available")
+                return None
+        if not self._graph_context.available:
+            return None
+        return self._graph_context
+
+    def _extract_last_read_file(self, messages: list[dict[str, Any]]) -> str | None:
+        """Most recently read file path — the BFS entry point for graph narrowing.
+
+        Scans assistant tool_use blocks in message order (oldest to newest)
+        for known read-tool calls, keeping the last match. A single forward
+        pass mirrors `_build_tool_name_map`'s scan style.
+        """
+        last: str | None = None
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                if block.get("name") not in _READ_TOOL_NAMES:
+                    continue
+                tool_input = block.get("input")
+                if not isinstance(tool_input, dict):
+                    continue
+                for key in _READ_PATH_ARG_KEYS:
+                    value = tool_input.get(key)
+                    if isinstance(value, str) and value:
+                        last = value
+                        break
+        return last
+
+    def _graph_narrow(
+        self,
+        content: str,
+        tool_name: str,
+        entry_file: str | None,
+    ) -> str:
+        """Narrow wide discovery-tool output to the entry file's import neighborhood.
+
+        Always CCR-recoverable: lines outside the neighborhood collapse
+        behind a single `<<ccr:HASH N_rows_offloaded>>` marker rather than
+        being discarded, so the agent can always retrieve the full output.
+        One code path — no separate lossy variant.
+
+        Returns `content` unchanged whenever narrowing can't be done with
+        confidence (no entry file, graph unavailable, output already small,
+        or no lines were actually dropped).
+        """
+        if entry_file is None or tool_name not in _DISCOVERY_TOOL_NAMES:
+            return content
+
+        lines = content.splitlines()
+        if len(lines) < self.config.graph_narrow_min_lines:
+            return content
+
+        ctx = self._get_graph_context()
+        if ctx is None:
+            return content
+
+        related = ctx.related_files(entry_file, max_hops=self.config.graph_narrow_max_hops)
+        if related is None:
+            return content
+
+        kept: list[str] = []
+        dropped: list[str] = []
+        for line in lines:
+            path = _extract_discovery_path(line, tool_name)
+            if path is None or path in related:
+                kept.append(line)
+            else:
+                dropped.append(line)
+
+        if not dropped:
+            return content
+
+        try:
+            from ..cache.compression_store import get_compression_store
+        except ImportError:
+            return content
+
+        hash_key = hashlib.sha256(content.encode()).hexdigest()[:24]
+        get_compression_store().store(content, "\n".join(kept), explicit_hash=hash_key)
+        kept.append(f"<<ccr:{hash_key} {len(dropped)}_rows_offloaded>>")
+        return "\n".join(kept)
+
     def _get_text_crusher(self) -> Any:
         """Get TextCrusher (Phase 2, lazy load). Returns None when disabled, or
         when the native ``headroom._core`` extension is not built (mirrors the
@@ -2483,6 +2620,9 @@ class ContentRouter(Transform):
 
         # Build tool name map for exclusion checking
         tool_name_map = self._build_tool_name_map(messages)
+        # Graph-scoped narrowing entry point: the agent's most recently read
+        # file. Computed once per apply() call, same scan pattern as above.
+        entry_file = self._extract_last_read_file(messages)
 
         # Compute excluded tool IDs based on config
         exclude_tools = (
@@ -2674,6 +2814,7 @@ class ContentRouter(Transform):
                     skip_user=skip_user,
                     skip_system=skip_system,
                     compress_assistant_text_blocks=compress_assistant_text_blocks,
+                    entry_file=entry_file,
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
@@ -3057,6 +3198,7 @@ class ContentRouter(Transform):
         skip_user: bool = True,
         skip_system: bool = True,
         compress_assistant_text_blocks: bool = False,
+        entry_file: str | None = None,
     ) -> dict[str, Any]:
         """Process content blocks (Anthropic format) for compression.
 
@@ -3096,6 +3238,8 @@ class ContentRouter(Transform):
             skip_system: If True, never compress text blocks in system-role messages.
             compress_assistant_text_blocks: If True, allow compressing text blocks in
                 assistant-role messages. Default False (cache-safe).
+            entry_file: Most recently read file path, used as the BFS entry point
+                for graph-scoped narrowing of discovery-tool output.
 
         Returns:
             Transformed message with compressed content blocks.
@@ -3136,8 +3280,36 @@ class ContentRouter(Transform):
 
             # Handle tool_result blocks
             if block_type == "tool_result":
-                # Check if tool is excluded from compression
                 tool_use_id = block.get("tool_use_id", "")
+                tool_name = (tool_name_map or {}).get(tool_use_id, "")
+                tool_content = block.get("content", "")
+
+                # Graph-scoped narrowing runs unconditionally for discovery-tool
+                # output, *before* the exclusion/protection checks below —
+                # including recent Grep/Glob/Read results that those checks
+                # would otherwise pass through byte-for-byte. That's safe here
+                # specifically because narrowing is always CCR-recoverable
+                # (see `_graph_narrow`): the agent can retrieve exactly what
+                # protection would have left in place, so narrowing carries
+                # the same guarantee as not touching the content at all.
+                if isinstance(tool_content, str) and tool_name in _DISCOVERY_TOOL_NAMES:
+                    narrowed = self._graph_narrow(tool_content, tool_name, entry_file)
+                    if narrowed is not tool_content:
+                        # Rebind `block` itself (not just the local `tool_content`)
+                        # so every downstream append below — exclusion,
+                        # error-protection, declined compression, small-content
+                        # passthrough — carries the narrowed content instead of
+                        # silently reverting to the original on any path that
+                        # doesn't recompute it.
+                        tool_content = narrowed
+                        block = {**block, "content": tool_content}
+                        any_compressed = True
+                        transforms_applied.append("router:graph_narrow")
+                        if route_counts is not None:
+                            route_counts.setdefault("graph_narrowed", 0)
+                            route_counts["graph_narrowed"] += 1
+
+                # Check if tool is excluded from compression
                 if tool_use_id in excluded_tool_ids:
                     if messages_from_end <= read_protection_window:
                         # Recent — protect as before
@@ -3149,10 +3321,7 @@ class ContentRouter(Transform):
                     # Old excluded-tool output — fall through to compression
 
                 # Look up tool-specific compression bias
-                tool_name = (tool_name_map or {}).get(tool_use_id, "")
                 bias = self._get_tool_bias(tool_name) if tool_name else 1.0
-
-                tool_content = block.get("content", "")
 
                 # Protection: failed tool calls / error outputs stay verbatim
                 # (issue #847). `is_error` is Anthropic's explicit failure
